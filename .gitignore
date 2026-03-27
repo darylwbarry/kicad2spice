@@ -1,0 +1,14 @@
+# API keys — never commit these
+.env
+openrouter_api_key.txt
+
+# Virtual environment
+venv/
+
+# Generated SPICE models (regenerated on demand)
+models/
+
+# Test output
+out*.cir
+__pycache__/
+*.pyc
