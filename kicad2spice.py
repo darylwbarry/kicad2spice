@@ -184,6 +184,7 @@ class Component:
     sim_library: 'str | None'
     sim_name: 'str | None'
     dnp: bool
+    sheet_path: str = '/'                               # KiCad sheetpath, e.g. "/LoopTest/"
     inferred: bool = False                              # True if sim_device was guessed from ref prefix
     pin_to_spice: dict = field(default_factory=dict)    # {"1": "VOUT", ...}
     spice_pin_order: list = field(default_factory=list) # ["VOUT", ...] by int key
@@ -195,6 +196,7 @@ class Netlist:
     components: dict = field(default_factory=dict)          # ref → Component
     ref_pin_to_net: dict = field(default_factory=dict)      # (ref, pin) → Net
     ref_pin_to_func: dict = field(default_factory=dict)     # (ref, pin) → pinfunction str
+    net_to_scope: dict = field(default_factory=dict)        # net.name → sheet_path or None (global)
 
 
 # ---------------------------------------------------------------------------
@@ -303,10 +305,14 @@ def parse_netlist(path: str) -> Netlist:
                 pin_to_spice = dict(_DEFAULT_TWO_PIN_PINS)
                 spice_pin_order = list(_DEFAULT_TWO_PIN_ORDER)
 
+            sheetpath_node = find_child(comp, 'sheetpath')
+            sheet_path = get_atom(sheetpath_node, 'names') if sheetpath_node else '/'
+
             components[ref] = Component(
                 ref=ref, value=value, sim_device=sim_device,
                 sim_pins=sim_pins_str, sim_library=sim_library,
-                sim_name=sim_name, dnp=dnp, inferred=inferred,
+                sim_name=sim_name, dnp=dnp, sheet_path=sheet_path,
+                inferred=inferred,
                 pin_to_spice=pin_to_spice, spice_pin_order=spice_pin_order,
             )
 
@@ -351,8 +357,22 @@ def parse_netlist(path: str) -> Netlist:
                 if func:
                     ref_pin_to_func[(ref, pin)] = func
 
+    # Compute net scope: for each net, which sheet are all its nodes on?
+    # If all connected components share one sheet → local to that sheet.
+    # If they span multiple sheets (or net is GND/power) → global (None).
+    net_to_sheets: dict = {}
+    for (ref, pin), net in ref_pin_to_net.items():
+        comp_sheet = components.get(ref)
+        sheet = comp_sheet.sheet_path if comp_sheet else '/'
+        net_to_sheets.setdefault(net.name, set()).add(sheet)
+
+    net_to_scope: dict = {}
+    for net_name, sheets in net_to_sheets.items():
+        net_to_scope[net_name] = sheets.pop() if len(sheets) == 1 else None
+
     return Netlist(source=source, components=components,
-                   ref_pin_to_net=ref_pin_to_net, ref_pin_to_func=ref_pin_to_func)
+                   ref_pin_to_net=ref_pin_to_net, ref_pin_to_func=ref_pin_to_func,
+                   net_to_scope=net_to_scope)
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +690,238 @@ def run_model_generation(netlist: Netlist, datasheets_dir: str,
 
 
 # ---------------------------------------------------------------------------
+# Hierarchical SPICE generation helpers
+# ---------------------------------------------------------------------------
+
+def _sheet_name(sheet_path: str) -> str:
+    """'/LoopTest/' → 'LoopTest', '/' → 'Root'"""
+    name = sheet_path.strip('/')
+    return name.replace('/', '_') if name else 'Root'
+
+
+def _net_node(net: Net, sheet_path: str, net_to_scope: dict) -> str:
+    """
+    Return the SPICE node name for `net` as used inside `sheet_path`.
+
+    - GND → '0' (global SPICE reference, never a port)
+    - Net local to this sheet → short name (strip sheet prefix)
+    - Global / cross-sheet net → full sanitized name (will be a port)
+    """
+    if net.spice_name == '0':
+        return '0'
+    scope = net_to_scope.get(net.name)  # sheet_path or None
+    if scope == sheet_path:
+        # Local net: strip the sheet prefix and re-sanitize the remainder
+        raw = net.name
+        local_part = raw[len(sheet_path):] if raw.startswith(sheet_path) else raw
+        return sanitize_net_name(local_part)
+    # Cross-sheet / global: use the full sanitized name — this will appear as a port
+    return sanitize_net_name(net.name)
+
+
+def _emit_comp_line(ref: str, comp: 'Component', netlist: 'Netlist',
+                    sheet_path: str) -> 'str | None':
+    """
+    Build the SPICE element line for one component.
+    Returns the line string, or None if the component should be skipped.
+    Prints warnings to stderr for skipped components.
+    """
+    device = comp.sim_device
+
+    if device in ('R', 'C', 'L', 'V'):
+        # Resolve the two terminal nets via pin_to_spice reverse mapping.
+        # For inferred passives pin_to_spice is {"1":"+","2":"-"}; for explicitly
+        # annotated components the KiCad pin ids may differ (e.g. "G1").
+        spice_to_kicad = {v: k for k, v in comp.pin_to_spice.items()}
+        kpin1 = spice_to_kicad.get('+') or '1'
+        kpin2 = spice_to_kicad.get('-') or '2'
+        n1 = netlist.ref_pin_to_net.get((ref, kpin1))
+        n2 = netlist.ref_pin_to_net.get((ref, kpin2))
+        if n1 is None or n2 is None:
+            print(f'WARNING: {ref}: missing net connection (pin {kpin1!r} or {kpin2!r})',
+                  file=sys.stderr)
+            return None
+        node1 = _net_node(n1, sheet_path, netlist.net_to_scope)
+        node2 = _net_node(n2, sheet_path, netlist.net_to_scope)
+        prefix = _ref_prefix(ref)
+        value = '1m' if (prefix in ('JP', 'FB') and comp.inferred) else comp.value
+        return f'{ref} {node1} {node2} {value}'
+
+    if device == 'D':
+        # Diode: D{ref} anode cathode model
+        # model = sim_name if set, else fall back to value
+        model = comp.sim_name or comp.value
+        spice_to_kicad = {v: k for k, v in comp.pin_to_spice.items()}
+        k_anode = spice_to_kicad.get('A') or spice_to_kicad.get('+') or '2'
+        k_cath = spice_to_kicad.get('K') or spice_to_kicad.get('-') or '1'
+        na = netlist.ref_pin_to_net.get((ref, k_anode))
+        nk = netlist.ref_pin_to_net.get((ref, k_cath))
+        if na is None or nk is None:
+            print(f'WARNING: {ref}: missing net for diode anode/cathode, skipping',
+                  file=sys.stderr)
+            return None
+        node_a = _net_node(na, sheet_path, netlist.net_to_scope)
+        node_k = _net_node(nk, sheet_path, netlist.net_to_scope)
+        return f'{ref} {node_a} {node_k} {model}'
+
+    if device == 'SUBCKT':
+        if not comp.sim_name or not comp.spice_pin_order:
+            print(f'WARNING: {ref}: SUBCKT missing Sim.Name or Sim.Pins, skipping',
+                  file=sys.stderr)
+            return None
+        spice_to_kicad = {v: k for k, v in comp.pin_to_spice.items()}
+        node_names = []
+        ok = True
+        for spice_pin in comp.spice_pin_order:
+            kicad_pin = spice_to_kicad.get(spice_pin)
+            if kicad_pin is None:
+                node_names.append('?')
+                ok = False
+                continue
+            net = netlist.ref_pin_to_net.get((ref, kicad_pin))
+            if net is None:
+                print(f'WARNING: {ref} pin {kicad_pin} ({spice_pin}) not connected',
+                      file=sys.stderr)
+                node_names.append('NC')
+            else:
+                node_names.append(_net_node(net, sheet_path, netlist.net_to_scope))
+        if not ok:
+            print(f'WARNING: {ref}: some SPICE pins unresolved', file=sys.stderr)
+        return f'X{ref} {" ".join(node_names)} {comp.sim_name}'
+
+    print(f'WARNING: {ref}: unsupported Sim.Device "{device}", skipping', file=sys.stderr)
+    return None
+
+
+def _generate_hierarchical(netlist: 'Netlist', lib_path: 'str | None') -> str:
+    lines = []
+    lines.append('* Generated by kicad2spice')
+    lines.append(f'* Source: {os.path.basename(netlist.source)}')
+    lines.append('')
+
+    # .include directives (all SUBCKT libraries, unique)
+    seen_libs: dict = {}
+    for comp in netlist.components.values():
+        if comp.sim_device == 'SUBCKT' and comp.sim_library:
+            norm = _normalize_lib_path(comp.sim_library, lib_path)
+            seen_libs[norm] = True
+    if seen_libs:
+        for lib in seen_libs:
+            lines.append(f'.include "{lib}"')
+        lines.append('')
+
+    # Group components by sheet
+    by_sheet: dict = {}
+    for ref, comp in netlist.components.items():
+        by_sheet.setdefault(comp.sheet_path, []).append(ref)
+
+    # Identify non-root sheets (direct children of '/')
+    # For deeper hierarchy this would need recursion; one level is handled here.
+    non_root = sorted(s for s in by_sheet if s != '/')
+
+    written = skipped = 0
+
+    # ── Subcircuit definition for each non-root sheet ──────────────────────
+    for sheet_path in non_root:
+        sheet_nm = _sheet_name(sheet_path)
+
+        # Ports = cross-sheet / global nets touching components on this sheet,
+        # excluding GND (node 0 is a SPICE global, never a port)
+        ports: dict = {}
+        for ref in by_sheet[sheet_path]:
+            for (r, pin), net in netlist.ref_pin_to_net.items():
+                if r != ref:
+                    continue
+                if net.spice_name == '0':
+                    continue
+                scope = netlist.net_to_scope.get(net.name)
+                if scope != sheet_path:          # not local → it's a port
+                    port_node = _net_node(net, sheet_path, netlist.net_to_scope)
+                    ports[port_node] = True
+
+        port_list = sorted(ports.keys())
+
+        lines.append(f'* {"=" * 60}')
+        lines.append(f'* Sheet: {sheet_path}')
+        lines.append(f'* {"=" * 60}')
+        if not port_list:
+            print(f'WARNING: sheet {sheet_path} has no cross-sheet nets; '
+                  f'subcircuit {sheet_nm!r} will have no ports', file=sys.stderr)
+        port_str = (' ' + ' '.join(port_list)) if port_list else ''
+        lines.append(f'.subckt {sheet_nm}{port_str}')
+
+        for ref in sorted(by_sheet[sheet_path], key=_ref_sort_key):
+            comp = netlist.components[ref]
+            if comp.dnp:
+                skipped += 1
+                continue
+            if comp.sim_device is None:
+                print(f'WARNING: {ref} ({comp.value}) has no Sim.Device, skipping',
+                      file=sys.stderr)
+                skipped += 1
+                continue
+            line = _emit_comp_line(ref, comp, netlist, sheet_path)
+            if line:
+                lines.append(f'  {line}')
+                written += 1
+            else:
+                skipped += 1
+
+        lines.append(f'.ends {sheet_nm}')
+        lines.append('')
+
+    # ── Top-level instantiations and root components ────────────────────────
+    lines.append('* Top level')
+
+    # Instantiate each non-root sheet
+    # Port values at root = the global net names (same as port names since they're global)
+    for sheet_path in non_root:
+        sheet_nm = _sheet_name(sheet_path)
+        # Recompute port list for this sheet (same logic as above)
+        ports: dict = {}
+        for ref in by_sheet[sheet_path]:
+            for (r, pin), net in netlist.ref_pin_to_net.items():
+                if r != ref:
+                    continue
+                if net.spice_name == '0':
+                    continue
+                scope = netlist.net_to_scope.get(net.name)
+                if scope != sheet_path:
+                    port_node = _net_node(net, sheet_path, netlist.net_to_scope)
+                    ports[port_node] = True
+        port_list = sorted(ports.keys())
+        port_str = (' ' + ' '.join(port_list)) if port_list else ''
+        lines.append(f'X_{sheet_nm}{port_str} {sheet_nm}')
+
+    # Emit any root-level components
+    root_refs = by_sheet.get('/', [])
+    if root_refs:
+        lines.append('')
+        for ref in sorted(root_refs, key=_ref_sort_key):
+            comp = netlist.components[ref]
+            if comp.dnp:
+                skipped += 1
+                continue
+            if comp.sim_device is None:
+                print(f'WARNING: {ref} ({comp.value}) has no Sim.Device, skipping',
+                      file=sys.stderr)
+                skipped += 1
+                continue
+            line = _emit_comp_line(ref, comp, netlist, '/')
+            if line:
+                lines.append(line)
+                written += 1
+            else:
+                skipped += 1
+
+    lines.append('')
+    lines.append('.end')
+
+    print(f'kicad2spice: wrote {written} elements, skipped {skipped}', file=sys.stderr)
+    return '\n'.join(lines) + '\n'
+
+
+# ---------------------------------------------------------------------------
 # SPICE generator
 # ---------------------------------------------------------------------------
 
@@ -681,7 +933,11 @@ def _normalize_lib_path(raw: str, lib_path: 'str | None') -> str:
     return normalized
 
 
-def generate_spice(netlist: Netlist, lib_path: 'str | None' = None) -> str:
+def generate_spice(netlist: Netlist, lib_path: 'str | None' = None,
+                   flat: bool = False) -> str:
+    if not flat:
+        return _generate_hierarchical(netlist, lib_path)
+    # ── flat (legacy) mode follows ──────────────────────────────────────────
     lines = []
     lines.append('* Generated by kicad2spice')
     lines.append(f'* Source: {os.path.basename(netlist.source)}')
@@ -832,6 +1088,8 @@ def main():
     parser.add_argument('--generated-dir', default=None,
                         help='Where to save AI-generated .sub models (default: '
                              'models/ next to the input .net file)')
+    parser.add_argument('--flat', action='store_true',
+                        help='Emit a flat netlist instead of hierarchical subcircuits')
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -850,7 +1108,7 @@ def main():
             sys.exit('ERROR: --generate-models requires OPENROUTER_API_KEY env var to be set')
         run_model_generation(netlist, datasheets_dir, api_key, generated_dir)
 
-    spice_text = generate_spice(netlist, lib_path=args.lib_path)
+    spice_text = generate_spice(netlist, lib_path=args.lib_path, flat=args.flat)
 
     if args.output:
         Path(args.output).write_text(spice_text, encoding='utf-8')
