@@ -184,6 +184,7 @@ class Component:
     sim_library: 'str | None'
     sim_name: 'str | None'
     dnp: bool
+    inferred: bool = False                              # True if sim_device was guessed from ref prefix
     pin_to_spice: dict = field(default_factory=dict)    # {"1": "VOUT", ...}
     spice_pin_order: list = field(default_factory=list) # ["VOUT", ...] by int key
 
@@ -291,10 +292,12 @@ def parse_netlist(path: str) -> Netlist:
             if sim_pins_str:
                 pin_to_spice, spice_pin_order = parse_sim_pins(sim_pins_str)
 
+            inferred = False
             if sim_device is None:
-                inferred = infer_sim_device(ref)
-                if inferred:
-                    sim_device = inferred
+                inferred_device = infer_sim_device(ref)
+                if inferred_device:
+                    sim_device = inferred_device
+                    inferred = True
 
             if sim_device in ('R', 'C', 'L') and not pin_to_spice:
                 pin_to_spice = dict(_DEFAULT_TWO_PIN_PINS)
@@ -303,7 +306,7 @@ def parse_netlist(path: str) -> Netlist:
             components[ref] = Component(
                 ref=ref, value=value, sim_device=sim_device,
                 sim_pins=sim_pins_str, sim_library=sim_library,
-                sim_name=sim_name, dnp=dnp,
+                sim_name=sim_name, dnp=dnp, inferred=inferred,
                 pin_to_spice=pin_to_spice, spice_pin_order=spice_pin_order,
             )
 
@@ -724,9 +727,11 @@ def generate_spice(netlist: Netlist, lib_path: 'str | None' = None) -> str:
                 skipped += 1
                 continue
 
-            # Jumpers (JP*) and ferrite beads (FB*) use 1mΩ (active/closed)
+            # Jumpers (JP*) and ferrite beads (FB*) with no explicit model
+            # are treated as 1mΩ (active/closed state).
+            # If Sim.Device was explicitly set in KiCad, use comp.value as-is.
             prefix = _ref_prefix(ref)
-            if prefix in ('JP', 'FB'):
+            if prefix in ('JP', 'FB') and comp.inferred:
                 value = '1m'
             else:
                 value = comp.value
