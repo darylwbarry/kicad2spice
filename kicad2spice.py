@@ -204,14 +204,17 @@ def sanitize_net_name(raw: str) -> str:
     if raw == 'GND':
         return '0'
     name = raw
-    name = re.sub(r'^/[^/]+/', '', name)
+    # Unwrap auto-named nets: Net-(C101-Pad1) → C101-Pad1
     if name.startswith('Net-(') and name.endswith(')'):
         name = name[5:-1]
+    # Unwrap unconnected nets
     if name.startswith('unconnected-(') and name.endswith(')'):
         name = 'NC_' + name[13:-1]
+    # Replace SPICE-illegal characters (including / hierarchy separators)
     name = re.sub(r'[()/ \t~{}]', '_', name)
     name = name.replace('-', '_')
     name = re.sub(r'_+', '_', name).strip('_')
+    # SPICE node names must not start with a digit
     if name and name[0].isdigit():
         name = 'N_' + name
     return name or 'UNNAMED'
